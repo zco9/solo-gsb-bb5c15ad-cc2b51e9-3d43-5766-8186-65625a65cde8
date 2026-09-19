@@ -1,0 +1,6 @@
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+httpx>=0.27,<1.0
+# IANA time-zone database: python:3.12-slim does not ship system tzdata,
+# which zoneinfo needs for delivery-window timezone resolution.
+tzdata>=2024.1

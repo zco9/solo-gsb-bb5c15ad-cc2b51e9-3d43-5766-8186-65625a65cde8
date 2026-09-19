@@ -1,0 +1,23 @@
+services:
+  webhook-relay:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      WORKER_COUNT: "4"          # concurrent delivery workers
+      HTTP_TIMEOUT_SECONDS: "5"  # per-attempt HTTP timeout
+      MAX_ATTEMPTS: "4"          # attempts per task before giving up
+      BACKOFF_BASE_SECONDS: "1"  # retry delays: 1s, 2s, 4s
+      BREAKER_FAILURE_THRESHOLD: "5"  # consecutive final failures that open a subscription's breaker
+      BREAKER_COOLDOWN_SECONDS: "30"  # cooldown before the single half-open probe is allowed
+      # Per-subscription rate limiting has no global env knob: configure each
+      # subscription via PUT /subscriptions/{id}/rate-policy (persisted in the DB).
+      INGEST_SECRET: "${INGEST_SECRET:-dev-ingest-secret-change-me}"
+      # INGEST_TIMESTAMP_TOLERANCE_SECONDS: "300"
+      # DB_PATH: /data/webhook_relay.db
+    volumes:
+      - webhook-data:/data       # persists the SQLite database
+    restart: unless-stopped
+
+volumes:
+  webhook-data:
