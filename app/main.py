@@ -180,11 +180,19 @@ def _delivery_window_out(now: float, policy: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db = Database(
-        config.DB_PATH,
-        breaker_failure_threshold=config.BREAKER_FAILURE_THRESHOLD,
-        breaker_cooldown_seconds=config.BREAKER_COOLDOWN_SECONDS,
-    )
+    # Build (and migrate) the database before anything else starts. A
+    # MigrationError -- failed version step or a failed foreign-key
+    # integrity check -- propagates out of startup, so uvicorn aborts and
+    # no delivery worker ever runs against an unverified schema.
+    try:
+        db = Database(
+            config.DB_PATH,
+            breaker_failure_threshold=config.BREAKER_FAILURE_THRESHOLD,
+            breaker_cooldown_seconds=config.BREAKER_COOLDOWN_SECONDS,
+        )
+    except Exception:
+        log.exception("database initialization failed; refusing to start")
+        raise
     app.state.db = db
     app.state.http = httpx.AsyncClient(timeout=config.HTTP_TIMEOUT)
 

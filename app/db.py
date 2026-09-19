@@ -3,50 +3,116 @@
 A single connection guarded by a lock serializes all access, which keeps the
 claim/update sequences atomic for the in-process workers. WAL mode is enabled
 so readers are not blocked while a worker writes attempt results.
+
+Schema upgrades run at startup through an ordered version chain anchored on
+``PRAGMA user_version`` (see ``_migrate`` / ``_STEPS``): every version's
+structural change and its version-number bump commit in one transaction, the
+SQLite write lock serializes concurrent startup instances, and a fresh
+database simply walks the whole chain to the latest version.
 """
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Callable
 
 from .delivery_window import DeliveryWindow, get_zone
 
-SCHEMA = """
+log = logging.getLogger("webhook-relay.db")
+
+
+class MigrationError(RuntimeError):
+    """Raised when the startup schema migration cannot complete safely.
+
+    The application treats this as fatal: workers must not start against a
+    database whose schema or foreign-key integrity is unverified.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Schema version chain
+#
+# PRAGMA user_version anchors an ordered chain of steps. Each step brings the
+# database from version (n-1) to n: its structural DDL and the
+# ``PRAGMA user_version=n`` bump run in ONE transaction, so a crash or error
+# mid-step rolls back completely and the step is simply retried on the next
+# startup. Steps are additionally written idempotently (they inspect the
+# existing schema before changing it), so databases created before
+# user_version was tracked -- all stamped 0 -- converge to the latest version
+# regardless of which features they already carry.
+#
+# A brand-new database is user_version 0 with no tables and walks the same
+# chain, so fresh and upgraded databases reach one identical final schema;
+# there is no separate "create everything" definition that could drift from
+# the migration end state.
+# ---------------------------------------------------------------------------
+
+LATEST_VERSION = 11
+
+# subscriptions as created by version 1 (later columns arrive via ALTER steps).
+_SUBSCRIPTIONS_V1 = """
 CREATE TABLE IF NOT EXISTS subscriptions (
     id          TEXT PRIMARY KEY,
     target_url  TEXT NOT NULL,
     secret      TEXT NOT NULL,
-    created_at  REAL NOT NULL,
-    paused_at   REAL,                   -- epoch seconds while paused; NULL when active
-    previous_secret            TEXT,    -- retired secret, dual-signed during the grace window
-    previous_secret_expires_at REAL,    -- epoch seconds when the previous secret stops being sent
-    breaker_state                TEXT NOT NULL DEFAULT 'closed'
-                                 CHECK (breaker_state IN ('closed', 'open', 'half_open')),
-    breaker_consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    breaker_next_probe_at        REAL,  -- epoch seconds when an open breaker allows its probe
-    breaker_probe_task_id        INTEGER, -- the single half-open probe task; NULL unless half_open
-    rate_capacity          REAL,        -- token-bucket size (max burst); NULL = rate limiting off
-    rate_refill_per_second REAL,        -- tokens added per second (sustained delivery rate)
-    rate_tokens            REAL,        -- persisted balance; refilled lazily by wall clock
-    rate_updated_at        REAL,        -- epoch seconds the balance was last persisted
-    window_timezone        TEXT,        -- delivery window: IANA zone; NULL when no window configured
-    window_weekdays        TEXT,        -- delivery window: JSON array of ISO weekdays 1..7
-    window_local_start     INTEGER,     -- delivery window: local seconds after midnight
-    window_local_end       INTEGER,     -- delivery window: local seconds; <= start = wraps midnight
-    window_updated_at      REAL         -- epoch seconds the window was last installed/replaced
-);
+    created_at  REAL NOT NULL
+)
+"""
 
+_EVENTS_V1 = """
 CREATE TABLE IF NOT EXISTS events (
     id          TEXT PRIMARY KEY,
-    payload     TEXT NOT NULL,          -- raw JSON body delivered to targets
+    payload     TEXT NOT NULL,
     created_at  REAL NOT NULL
-);
+)
+"""
 
+# tasks as created by version 1: the status CHECK predates the 'cancelled'
+# terminal state and the table has neither cancelled_at nor deliver_at.
+_TASKS_V1 = """
 CREATE TABLE IF NOT EXISTS tasks (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id         TEXT NOT NULL REFERENCES events(id),
+    subscription_id  TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'in_progress', 'delivered', 'failed')),
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    max_attempts     INTEGER NOT NULL,
+    next_attempt_at  REAL,
+    claimed_by       TEXT,
+    last_status_code INTEGER,
+    last_error       TEXT,
+    result           TEXT CHECK (result IN ('delivered', 'failed')),
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    UNIQUE (event_id, subscription_id)
+)
+"""
+
+_ATTEMPTS_V1 = """
+CREATE TABLE IF NOT EXISTS attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    attempt_no  INTEGER NOT NULL,
+    status_code INTEGER,
+    error       TEXT,
+    started_at  REAL NOT NULL,
+    finished_at REAL NOT NULL
+)
+"""
+
+# tasks rebuilt for the 'cancelled' terminal state (version 7). SQLite cannot
+# ALTER a CHECK constraint, so the table is rebuilt per the SQLite recommended
+# procedure with foreign keys temporarily disabled outside the transaction.
+# deliver_at is intentionally absent here: it arrives in version 8.
+_TASKS_V7 = """
+CREATE TABLE tasks_new (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id         TEXT NOT NULL REFERENCES events(id),
     subscription_id  TEXT NOT NULL,
@@ -55,55 +121,223 @@ CREATE TABLE IF NOT EXISTS tasks (
                        ('pending', 'in_progress', 'delivered', 'failed', 'cancelled')),
     attempts         INTEGER NOT NULL DEFAULT 0,
     max_attempts     INTEGER NOT NULL,
-    deliver_at       REAL,              -- requested scheduled time (epoch seconds); NULL = immediate
-    next_attempt_at  REAL,              -- epoch seconds; NULL once finished
+    next_attempt_at  REAL,
     claimed_by       TEXT,
     last_status_code INTEGER,
     last_error       TEXT,
     result           TEXT CHECK (result IN ('delivered', 'failed')),
     created_at       REAL NOT NULL,
     updated_at       REAL NOT NULL,
-    cancelled_at     REAL,              -- epoch seconds when an event cancel claimed the task
-    UNIQUE (event_id, subscription_id)  -- one task per (event, subscription)
-);
-
-CREATE TABLE IF NOT EXISTS attempts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     INTEGER NOT NULL REFERENCES tasks(id),
-    attempt_no  INTEGER NOT NULL,
-    status_code INTEGER,                -- NULL when the request never got a response
-    error       TEXT,
-    started_at  REAL NOT NULL,
-    finished_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ingested_events (
-    id          TEXT PRIMARY KEY,       -- X-Webhook-Id of a verified inbound event
-    raw_body    BLOB NOT NULL,          -- exact original JSON bytes, for conflict checks
-    receipt     TEXT NOT NULL,          -- JSON acceptance response returned first time
-    created_at  REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS subscription_topics (
-    subscription_id TEXT NOT NULL,      -- live routing set; memberships are removed
-    topic           TEXT NOT NULL,      -- together with the subscription on delete
-    created_at      REAL NOT NULL,      -- (delivery task history is still retained)
-    PRIMARY KEY (subscription_id, topic)
-);
-
-CREATE TABLE IF NOT EXISTS topic_events (
-    id          TEXT PRIMARY KEY,       -- shares the global event id namespace
-    topic       TEXT NOT NULL,          -- topic snapshotted at first publication
-    payload     TEXT NOT NULL,          -- canonical JSON, compared verbatim on replay
-    receipt     TEXT NOT NULL,          -- JSON acceptance (snapshot recipients + tasks)
-    created_at  REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks (status, next_attempt_at);
-CREATE INDEX IF NOT EXISTS idx_tasks_sub_order ON tasks (subscription_id, id, status);
-CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
-CREATE INDEX IF NOT EXISTS idx_subscription_topics_topic ON subscription_topics (topic);
+    cancelled_at     REAL,
+    UNIQUE (event_id, subscription_id)
+)
 """
+
+_INGESTED_EVENTS_V9 = """
+CREATE TABLE IF NOT EXISTS ingested_events (
+    id          TEXT PRIMARY KEY,
+    raw_body    BLOB NOT NULL,
+    receipt     TEXT NOT NULL,
+    created_at  REAL NOT NULL
+)
+"""
+
+_SUBSCRIPTION_TOPICS_V10 = """
+CREATE TABLE IF NOT EXISTS subscription_topics (
+    subscription_id TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    PRIMARY KEY (subscription_id, topic)
+)
+"""
+
+_TOPIC_EVENTS_V11 = """
+CREATE TABLE IF NOT EXISTS topic_events (
+    id          TEXT PRIMARY KEY,
+    topic       TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    receipt     TEXT NOT NULL,
+    created_at  REAL NOT NULL
+)
+"""
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
+) -> None:
+    """Add each missing column via ALTER TABLE; columns already present stay.
+
+    Runs inside the caller's migration transaction, so a failure rolls back
+    every ALTER issued by the step.
+    """
+    existing = _table_columns(conn, table)
+    for name, declaration in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            existing.add(name)
+
+
+def _step_1_base_tables(conn: sqlite3.Connection) -> None:
+    """Initial schema: subscriptions/events/tasks/attempts plus their indexes."""
+    conn.execute(_SUBSCRIPTIONS_V1)
+    conn.execute(_EVENTS_V1)
+    conn.execute(_TASKS_V1)
+    conn.execute(_ATTEMPTS_V1)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks (status, next_attempt_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_sub_order ON tasks (subscription_id, id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id)")
+
+
+def _step_2_pause(conn: sqlite3.Connection) -> None:
+    _ensure_columns(conn, "subscriptions", (("paused_at", "REAL"),))
+
+
+def _step_3_secret_rotation(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "subscriptions",
+        (
+            ("previous_secret", "TEXT"),
+            ("previous_secret_expires_at", "REAL"),
+        ),
+    )
+
+
+def _step_4_breaker(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "subscriptions",
+        (
+            ("breaker_state", "TEXT NOT NULL DEFAULT 'closed'"),
+            ("breaker_consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+            ("breaker_next_probe_at", "REAL"),
+            ("breaker_probe_task_id", "INTEGER"),
+        ),
+    )
+
+
+def _step_5_rate_limit(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "subscriptions",
+        (
+            ("rate_capacity", "REAL"),
+            ("rate_refill_per_second", "REAL"),
+            ("rate_tokens", "REAL"),
+            ("rate_updated_at", "REAL"),
+        ),
+    )
+
+
+def _step_6_delivery_window(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "subscriptions",
+        (
+            ("window_timezone", "TEXT"),
+            ("window_weekdays", "TEXT"),
+            ("window_local_start", "INTEGER"),
+            ("window_local_end", "INTEGER"),
+            ("window_updated_at", "REAL"),
+        ),
+    )
+
+
+def _step_7_tasks_cancelled(conn: sqlite3.Connection) -> None:
+    """Widen the tasks status CHECK to accept 'cancelled' (+ cancelled_at).
+
+    The only occurrence of the token 'cancelled' in the tasks CREATE
+    statement is the status CHECK, so inspecting sqlite_master tells a
+    pre-cancel table from an already-rebuilt one. The rebuild (foreign keys
+    off, in one transaction, per the SQLite documented procedure) copies
+    every existing task row verbatim; cancelled_at is NULL for history.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+    ).fetchone()
+    if row is not None and "cancelled" in (row["sql"] or ""):
+        return  # already rebuilt (possibly by a pre-user_version release)
+    # Remove an artifact left by a rebuild attempt that never committed, so a
+    # repaired database can resume from this step instead of erroring on it.
+    conn.execute("DROP TABLE IF EXISTS tasks_new")
+    conn.execute(_TASKS_V7)
+    conn.execute(
+        """
+        INSERT INTO tasks_new
+            (id, event_id, subscription_id, status, attempts, max_attempts,
+             next_attempt_at, claimed_by, last_status_code, last_error,
+             result, created_at, updated_at)
+        SELECT id, event_id, subscription_id, status, attempts, max_attempts,
+               next_attempt_at, claimed_by, last_status_code, last_error,
+               result, created_at, updated_at
+        FROM tasks
+        """
+    )
+    conn.execute("DROP TABLE tasks")
+    conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
+    # The two tasks indexes were dropped together with the old table.
+    conn.execute("CREATE INDEX idx_tasks_due ON tasks (status, next_attempt_at)")
+    conn.execute("CREATE INDEX idx_tasks_sub_order ON tasks (subscription_id, id, status)")
+
+
+def _step_8_scheduled_delivery(conn: sqlite3.Connection) -> None:
+    # A database whose tasks table was rebuilt by a newer pre-user_version
+    # release may already carry this column; the guard keeps that a no-op.
+    if "deliver_at" not in _table_columns(conn, "tasks"):
+        conn.execute("ALTER TABLE tasks ADD COLUMN deliver_at REAL")
+
+
+def _step_9_ingested_events(conn: sqlite3.Connection) -> None:
+    conn.execute(_INGESTED_EVENTS_V9)
+
+
+def _step_10_subscription_topics(conn: sqlite3.Connection) -> None:
+    conn.execute(_SUBSCRIPTION_TOPICS_V10)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_subscription_topics_topic "
+        "ON subscription_topics (topic)"
+    )
+
+
+def _step_11_topic_events(conn: sqlite3.Connection) -> None:
+    conn.execute(_TOPIC_EVENTS_V11)
+
+
+@dataclass(frozen=True)
+class _Step:
+    """One version-chain step.
+
+    foreign_keys_off marks the single table-rebuild step: PRAGMA
+    foreign_keys is a no-op inside a transaction, so it must be toggled in
+    autocommit mode before the step's BEGIN (and restored after its COMMIT).
+    """
+
+    description: str
+    apply: Callable[[sqlite3.Connection], None]
+    foreign_keys_off: bool = False
+
+
+# Indexed by the version the step produces (_STEPS[0] is unused).
+_STEPS: tuple[_Step | None, ...] = (
+    None,
+    _Step("initial tables (subscriptions, events, tasks, attempts)", _step_1_base_tables),
+    _Step("subscriptions.paused_at", _step_2_pause),
+    _Step("secret rotation columns", _step_3_secret_rotation),
+    _Step("circuit breaker columns", _step_4_breaker),
+    _Step("token-bucket rate-limit columns", _step_5_rate_limit),
+    _Step("delivery-window columns", _step_6_delivery_window),
+    _Step("rebuild tasks with 'cancelled' status and cancelled_at",
+          _step_7_tasks_cancelled, foreign_keys_off=True),
+    _Step("tasks.deliver_at (scheduled delivery)", _step_8_scheduled_delivery),
+    _Step("ingested_events table", _step_9_ingested_events),
+    _Step("subscription_topics table", _step_10_subscription_topics),
+    _Step("topic_events table", _step_11_topic_events),
+)
+
 
 # Columns returned to the API layer for a subscription (never secret material).
 _SUB_COLUMNS = (
@@ -225,6 +459,7 @@ class Database:
     ):
         self._breaker_threshold = breaker_failure_threshold
         self._breaker_cooldown = breaker_cooldown_seconds
+        self._path = path
         # isolation_level=None puts the connection in SQLite autocommit mode:
         # the driver never opens an implicit transaction behind our back, so
         # *every* transaction boundary is one we state explicitly
@@ -251,18 +486,19 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         # When several worker *processes* share the database file, an
         # IMMEDIATE write lock can momentarily be held by another connection;
-        # wait for it instead of failing instantly with SQLITE_BUSY.
+        # wait for it instead of failing instantly with SQLITE_BUSY. This is
+        # also what serializes startup migrations across instances: a second
+        # instance blocks on the first instance's migration write lock and
+        # then re-reads PRAGMA user_version to skip the completed steps.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._lock = threading.Lock()
-        with self._lock:
-            # In autocommit mode each CREATE TABLE IF NOT EXISTS statement is
-            # a one-statement transaction on its own; the migration's ALTERs
-            # run the same way, and the explicit table rebuild keeps its own
-            # BEGIN/COMMIT. The trailing commit is a harmless no-op kept for
-            # symmetry with the old implicit-transaction lifecycle.
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._conn.commit()
+        try:
+            with self._lock:
+                self._migrate()
+        except BaseException:
+            # Never leave a half-constructed Database holding the file open.
+            self._conn.close()
+            raise
 
     @contextmanager
     def _immediate(self):
@@ -285,149 +521,112 @@ class Database:
             self._conn.commit()
 
     def _migrate(self) -> None:
-        """Bring databases created by older versions up to date.
+        """Bring the database up to LATEST_VERSION through the version chain.
 
-        CREATE TABLE IF NOT EXISTS leaves pre-existing tables untouched, so
-        columns added later are applied here via ALTER TABLE. The tasks
-        table additionally needs a widened status CHECK to accept the
-        'cancelled' terminal state; SQLite cannot ALTER a CHECK constraint,
-        so an old tasks table is rebuilt (foreign_keys off, inside a single
-        transaction, per the SQLite recommended table-rebuild procedure).
+        Concurrency model -- multiple instances starting against the same
+        file: each step runs inside ``BEGIN IMMEDIATE``, which takes the
+        SQLite write lock before anything is read. Concurrent instances are
+        serialized by that lock (busy_timeout makes latecomers wait rather
+        than fail); once it has the lock the instance RE-READS
+        ``PRAGMA user_version`` and skips every step another instance already
+        committed, so each structural change is applied exactly once.
+
+        Failure model -- each step's DDL and its ``PRAGMA user_version`` bump
+        are one transaction; any error rolls the step back entirely, so the
+        version pointer never advances past a change that did not commit.
+        After the underlying problem is fixed (e.g. a stale ``tasks_new``
+        table or a manually repaired schema), restarting resumes exactly at
+        the unfinished step. A database stamped above what this build knows
+        is refused rather than silently downgraded.
+
+        After the chain reaches the latest version, PRAGMA
+        foreign_key_check runs; any dangling reference aborts startup so no
+        worker can operate on a database that violates referential integrity.
+
+        A brand-new file (user_version 0, no user tables) is created by
+        walking the very same chain, so fresh and upgraded databases end at
+        one identical schema and there is no separate "current schema"
+        definition to keep in sync.
         """
-        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
-        if "paused_at" not in cols:
-            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN paused_at REAL")
-        if "previous_secret" not in cols:
-            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN previous_secret TEXT")
-        if "previous_secret_expires_at" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN previous_secret_expires_at REAL"
-            )
-        if "breaker_state" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN breaker_state TEXT NOT NULL DEFAULT 'closed'"
-            )
-        if "breaker_consecutive_failures" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN breaker_consecutive_failures "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-        if "breaker_next_probe_at" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN breaker_next_probe_at REAL"
-            )
-        if "breaker_probe_task_id" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN breaker_probe_task_id INTEGER"
-            )
-        if "rate_capacity" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN rate_capacity REAL"
-            )
-        if "rate_refill_per_second" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN rate_refill_per_second REAL"
-            )
-        if "rate_tokens" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN rate_tokens REAL"
-            )
-        if "rate_updated_at" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN rate_updated_at REAL"
-            )
-        if "window_timezone" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN window_timezone TEXT"
-            )
-        if "window_weekdays" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN window_weekdays TEXT"
-            )
-        if "window_local_start" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN window_local_start INTEGER"
-            )
-        if "window_local_end" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN window_local_end INTEGER"
-            )
-        if "window_updated_at" not in cols:
-            self._conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN window_updated_at REAL"
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > LATEST_VERSION:
+            raise MigrationError(
+                f"database schema version {version} is newer than this release "
+                f"supports (latest {LATEST_VERSION}); refusing to start"
             )
 
-        task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
-        if "cancelled_at" not in task_cols:
-            # Commit the subscription ALTERs first; the rebuild then runs as
-            # its own explicit transaction. executescript() is avoided on
-            # purpose: it silently COMMITs any open transaction first.
-            self._conn.commit()
-            self._conn.execute("PRAGMA foreign_keys=OFF")
+        user_objects = self._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        if version == 0 and user_objects:
+            # A database created before user_version tracking: its features
+            # vary, but every step is idempotent and converges it to latest.
+            log.info(
+                "database %s predates schema versioning; migrating from version 0",
+                self._path,
+            )
+
+        while version < LATEST_VERSION:
+            step = _STEPS[version + 1]
+            # PRAGMA foreign_keys only takes effect outside a transaction;
+            # do the toggle in autocommit mode before taking the write lock.
+            if step.foreign_keys_off:
+                self._conn.execute("PRAGMA foreign_keys=OFF")
             try:
-                self._conn.execute("BEGIN")
-                self._conn.execute(
-                    """
-                    CREATE TABLE tasks_new (
-                        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                        event_id         TEXT NOT NULL REFERENCES events(id),
-                        subscription_id  TEXT NOT NULL,
-                        status           TEXT NOT NULL DEFAULT 'pending'
-                                         CHECK (status IN
-                                           ('pending', 'in_progress', 'delivered',
-                                            'failed', 'cancelled')),
-                        attempts         INTEGER NOT NULL DEFAULT 0,
-                        max_attempts     INTEGER NOT NULL,
-                        deliver_at       REAL,
-                        next_attempt_at  REAL,
-                        claimed_by       TEXT,
-                        last_status_code INTEGER,
-                        last_error       TEXT,
-                        result           TEXT CHECK (result IN ('delivered', 'failed')),
-                        created_at       REAL NOT NULL,
-                        updated_at       REAL NOT NULL,
-                        cancelled_at     REAL,
-                        UNIQUE (event_id, subscription_id)
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    # Re-read under the write lock: another instance may have
+                    # committed this (and later) steps while we waited.
+                    current = int(
+                        self._conn.execute("PRAGMA user_version").fetchone()[0]
                     )
-                    """
-                )
-                self._conn.execute(
-                    """
-                    INSERT INTO tasks_new
-                        (id, event_id, subscription_id, status, attempts, max_attempts,
-                         deliver_at, next_attempt_at, claimed_by, last_status_code, last_error,
-                         result, created_at, updated_at, cancelled_at)
-                    SELECT id, event_id, subscription_id, status, attempts, max_attempts,
-                           NULL, next_attempt_at, claimed_by, last_status_code, last_error,
-                           result, created_at, updated_at, NULL
-                    FROM tasks
-                    """
-                )
-                self._conn.execute("DROP TABLE tasks")
-                self._conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
-                self._conn.execute(
-                    "CREATE INDEX idx_tasks_due ON tasks (status, next_attempt_at)"
-                )
-                self._conn.execute(
-                    "CREATE INDEX idx_tasks_sub_order ON tasks (subscription_id, id, status)"
-                )
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
+                    if current >= LATEST_VERSION:
+                        self._conn.execute("ROLLBACK")
+                        break
+                    if current != version:
+                        # The instance that owned the lock advanced past us;
+                        # discard our view and continue from its version.
+                        self._conn.execute("ROLLBACK")
+                        version = current
+                        continue
+                    step.apply(self._conn)
+                    self._conn.execute(f"PRAGMA user_version={version + 1}")
+                    self._conn.execute("COMMIT")
+                    version += 1
+                    log.info("migrated schema to version %s (%s)",
+                             version, step.description)
+                except BaseException:
+                    self._conn.execute("ROLLBACK")
+                    raise
             finally:
-                # Re-enable foreign keys while outside the transaction; the
-                # constructor's ON setting is what every new connection gets.
-                self._conn.execute("PRAGMA foreign_keys=ON")
-            # The rebuild above already has the column; refresh the set so
-            # the ALTER below is skipped for this database.
-            task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+                if step.foreign_keys_off:
+                    # Restore outside the transaction (the connection's
+                    # normal operating mode is foreign_keys=ON).
+                    self._conn.execute("PRAGMA foreign_keys=ON")
 
-        if "deliver_at" not in task_cols:
-            # A database created by a version that already had 'cancelled'
-            # but predates scheduled delivery: just add the column. Existing
-            # rows get NULL, i.e. their tasks were immediate submissions.
-            self._conn.execute("ALTER TABLE tasks ADD COLUMN deliver_at REAL")
+        self._check_foreign_keys()
+
+    def _check_foreign_keys(self) -> None:
+        """Verify referential integrity after migration; fail closed on violations.
+
+        Runs independently of the PRAGMA foreign_keys setting, so it also
+        inspects rows a database may have carried since before enforcement
+        mattered. A failure raises MigrationError and startup aborts before
+        any worker is started.
+        """
+        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+        if not violations:
+            return
+        detail = ", ".join(
+            f"table {row[0]} rowid {row[1]} -> missing parent in {row[2]}"
+            for row in violations[:10]
+        )
+        raise MigrationError(
+            f"foreign-key integrity check failed after schema migration "
+            f"({len(violations)} violating row(s); first: {detail}); "
+            "refusing to start -- repair the database and restart"
+        )
 
     def close(self) -> None:
         with self._lock:
