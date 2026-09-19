@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 
 from . import config, signing
-from .db import Database
+from .db import Database, MigrationError
 from .delivery_window import DeliveryWindow, format_clock, parse_clock
 from .schemas import (
     DeliveryStatus,
@@ -180,11 +180,23 @@ def _delivery_window_out(now: float, policy: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db = Database(
-        config.DB_PATH,
-        breaker_failure_threshold=config.BREAKER_FAILURE_THRESHOLD,
-        breaker_cooldown_seconds=config.BREAKER_COOLDOWN_SECONDS,
-    )
+    # Constructing the Database runs the ordered PRAGMA user_version chain
+    # and a final foreign-key integrity check. A failure must abort startup:
+    # propagate it before any worker is created, so no delivery runs against
+    # a partially migrated or inconsistent database.
+    try:
+        db = Database(
+            config.DB_PATH,
+            breaker_failure_threshold=config.BREAKER_FAILURE_THRESHOLD,
+            breaker_cooldown_seconds=config.BREAKER_COOLDOWN_SECONDS,
+        )
+    except MigrationError:
+        log.critical(
+            "database migration failed for db=%s; refusing to start",
+            config.DB_PATH,
+            exc_info=True,
+        )
+        raise
     app.state.db = db
     app.state.http = httpx.AsyncClient(timeout=config.HTTP_TIMEOUT)
 

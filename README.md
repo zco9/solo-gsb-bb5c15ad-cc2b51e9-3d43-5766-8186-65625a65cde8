@@ -34,7 +34,7 @@ docker compose up --build
 ```
 
 一条命令完成镜像构建与启动：服务监听容器内 **8000** 端口，`docker-compose.yml` 通过 `"8000:8000"` 映射到宿主机同一端口，启动后访问 **http://localhost:8000**（交互式 API 文档：http://localhost:8000/docs，健康检查：http://localhost:8000/healthz）。
-SQLite 数据库保存在名为 `webhook-data` 的卷（容器内 `/data/webhook_relay.db`）中，容器重启后任务不丢失，老版本数据库在启动时自动迁移。
+SQLite 数据库保存在名为 `webhook-data` 的卷（容器内 `/data/webhook_relay.db`）中，容器重启后任务不丢失。老版本数据库在启动时按 `PRAGMA user_version` 版本链**自动迁移**：每个版本的结构变更与版本号推进在同一事务内提交，多实例同时启动时由数据库写锁串行（后到实例复查版本后跳过已完成步骤）；任一步骤失败整体回滚，修复数据库文件后再次启动即从断点继续升级；迁移结束执行外键完整性检查（`PRAGMA foreign_key_check`），不通过则拒绝启动、不启动任何工作器。
 熔断阈值与冷却时间等配置均可在 `docker-compose.yml` 的 `environment` 中调整（见文末配置表）。
 
 `/ingest` 的密钥默认使用 compose 内置的开发值 `dev-ingest-secret-change-me`，生产环境请通过环境变量覆盖：
@@ -754,6 +754,8 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 
 ## 设计说明
 
+- **启动迁移（PRAGMA user_version 顺序版本链）**：所有结构变更按有序版本链登记（`app/db.py` 中追加式的 `_MIGRATIONS`，版本号只增、永不重排）。每个版本的 DDL 与 `PRAGMA user_version` 推进在**同一个 `BEGIN IMMEDIATE` 事务**内提交（SQLite 的 DDL 与该 pragma 均可回滚），因此外部只能观察到完整版本；**新建库**在单事务内直接创建最新结构并加盖最新版本，不遍历历史链。迁移开始前先取数据库写锁并在锁内复查 `user_version`：多个实例（或多进程）同时启动时写锁把迁移串行化，后到实例等待 `busy_timeout` 后读到已提交的版本，跳过全部已完成步骤——每个步骤全局只执行一次。任意步骤异常时该步骤的全部 DDL/数据搬运与版本号推进整体回滚，文件停留在上一个完整版本；修复后再次启动会从失败版本继续升级（各步骤对版本 0 的旧库均按列/表是否存在做幂等守卫，可安全重放）。数据库文件的版本新于当前代码支持的版本时拒绝启动（防止降级破坏）。全部步骤完成后执行 `PRAGMA foreign_key_check`：发现违例行即抛出迁移错误，FastAPI 生命周期在创建任何工作器之前终止（容器 `restart: unless-stopped` 会重启但始终不投递），保证不会在结构不一致的库上运行。需要重建表的版本（`tasks` 的 `cancelled` CHECK 扩宽）按 SQLite 官方流程在事务外临时 `foreign_keys=OFF`，事务提交后立即恢复 `ON`，并由最终的外键检查兜底。
+
 - **任务模型**：事件存于 `events` 表（payload 只存一份），每个 `(event_id, subscription_id)` 对应 `tasks` 表中一行（唯一约束保证幂等）；每次尝试写入 `attempts` 历史表。
 - **入站幂等**：每个验签通过的 `X-Webhook-Id` 在 `ingested_events` 表中记录一行（原始 body 字节 + 首次回执）。查重、冲突判定、建事件、建任务在同一个 SQLite 事务中完成；重放请求直接返回存储的首次回执，即使并发到达也只会有一个请求建任务。
 - **原子认领**：工作器在单个连接锁保护的临界区内完成「选中最旧到期任务 → 置为 `in_progress`」，且该事务以 `BEGIN IMMEDIATE` 开启（配合 `busy_timeout=5000`），在 SELECT 之前即取得 SQLite 写锁，因此即使多个工作器分属不同进程、共享同一个数据库文件，同一轮尝试也会在数据库层被串行化、不会被重复领取；纯空闲轮询不产生任何写入并回滚（ROLLBACK），不触发 fsync。
@@ -794,12 +796,13 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 app/
 ├── main.py            # FastAPI 应用：API 端点 + 生命周期（启动/停止工作器）
 ├── worker.py          # 投递工作器：认领任务、HTTP 投递、记录结果
-├── db.py              # SQLite 持久层：建表、原子认领、状态更新
+├── db.py              # SQLite 持久层：user_version 版本链迁移、建表、原子认领、状态更新
 ├── delivery_window.py # 投递时段：IANA 时区、星期窗口、DST 安全的确定性调度
 ├── schemas.py         # Pydantic 请求/响应模型
 ├── signing.py         # HMAC-SHA256 签名与验签
 └── config.py          # 环境变量配置
 tests/
+├── test_db_migrations.py        # 启动迁移版本链：新库直达、旧库升级保数据、步骤事务原子性、并发串行、外键检查拒绝启动
 └── test_delivery_window_dst.py # 投递时段 DST 回归（秋令回拨两个 fold、春令跳空、星期归属、认领/限流顺序）
 Dockerfile
 docker-compose.yml
